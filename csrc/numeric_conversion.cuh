@@ -71,7 +71,7 @@ __device__ __forceinline__ void floatx4_to_e5m2x4(uint32_t *dest, float *source0
       "cvt.rn.satfinite.e5m2x2.f32   hi, %4, %3;\n" \
       "mov.b32 %0, {lo, hi};\n" \
       "}" \
-      : "=r"(dest[0]) : "f"(source0[0]), "f"(source1[1]), "f"(source1[0]), "f"(source1[1]));
+      : "=r"(dest[0]) : "f"(source0[0]), "f"(source0[1]), "f"(source1[0]), "f"(source1[1]));
 #else
   RUNTIME_ASSERT("Unsupported CUDA architecture for FP8 CAST instruction");
 #endif

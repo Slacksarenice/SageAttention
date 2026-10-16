@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
 import torch
 from typing import Any, List, Literal, Optional, Tuple, Union
 
@@ -91,7 +92,7 @@ def per_block_int8(
     if sm_scale is None:
         sm_scale = head_dim**-0.5
     
-    sm_scale *= 1.44269504
+    sm_scale *= math.log2(math.e)
 
     _fused.quant_per_block_int8_cuda(q, q_int8, q_scale, sm_scale, BLKQ, _tensor_layout)
     if km is not None:

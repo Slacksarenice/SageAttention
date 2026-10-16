@@ -117,7 +117,8 @@ def _attn_fwd(Q, K, V,
                                     BLOCK_M, HEAD_DIM, BLOCK_N,  
                                     4 - STAGE, offs_m, offs_n 
                                     )
-    acc = acc / l_i[:, None]
+    # one reciprocal per row instead of BLOCK_M * HEAD_DIM divisions
+    acc = acc * (1.0 / l_i)[:, None]
     tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
 
 def forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=torch.float16):

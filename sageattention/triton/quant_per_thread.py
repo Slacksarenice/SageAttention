@@ -38,8 +38,10 @@ def quant_query_per_thread_int8_kernel(Input, Output, Scale, L,
 
     x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
     x = x.to(tl.float32)
-    scale = tl.max(tl.abs(x)) / 127. + 0.0000001
-    x_int8 = x / scale
+    # eps as a floor (not an additive bias) keeps the full int8 range for small-magnitude rows
+    amax = tl.maximum(tl.max(tl.abs(x)), 1e-7)
+    scale = amax / 127.
+    x_int8 = x * (127. / amax)
     x_int8 += 0.5 * tl.where(x_int8 >= 0, 1, -1)
     x_int8 = x_int8.to(tl.int8)
     tl.store(output_ptrs, x_int8, mask=offs_n[:, None] < L)
@@ -86,9 +88,11 @@ def quant_key_per_thread_int8_kernel(Input, Output, Scale, L,
     x1 = tl.load(input_ptrs1, mask=offs_n1[:, None] < L)
     x0 = x0.to(tl.float32)
     x1 = x1.to(tl.float32)
-    scale = max(tl.max(tl.abs(x0)), tl.max(tl.abs(x1))) / 127. + 0.0000001
-    x0_int8 = x0 / scale
-    x1_int8 = x1 / scale
+    amax = tl.maximum(tl.maximum(tl.max(tl.abs(x0)), tl.max(tl.abs(x1))), 1e-7)
+    scale = amax / 127.
+    rcp_scale = 127. / amax
+    x0_int8 = x0 * rcp_scale
+    x1_int8 = x1 * rcp_scale
     x0_int8 += 0.5 * tl.where(x0_int8 >= 0, 1, -1)
     x1_int8 += 0.5 * tl.where(x1_int8 >= 0, 1, -1)
     x0_int8 = x0_int8.to(tl.int8)
@@ -117,8 +121,9 @@ def quant_query_per_thread_int4_kernel(Input, Output, Scale, L,
 
     x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
     x = x.to(tl.float32)
-    scale = tl.max(tl.abs(x)) / 7. + 0.0000001
-    x_int8 = x / scale
+    amax = tl.maximum(tl.max(tl.abs(x)), 1e-7)
+    scale = amax / 7.
+    x_int8 = x * (7. / amax)
     x_int8 += 0.5 * tl.where(x_int8 >= 0, 1, -1)
     x_int8 = x_int8.to(tl.int8)
     tl.store(output_ptrs, x_int8, mask=offs_n[:, None] < L)
@@ -144,8 +149,9 @@ def quant_key_per_thread_int4_kernel(Input, Output, Scale, L,
 
     x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
     x = x.to(tl.float32)
-    scale = tl.max(tl.abs(x)) / 7. + 0.0000001
-    x_int8 = x / scale
+    amax = tl.maximum(tl.max(tl.abs(x)), 1e-7)
+    scale = amax / 7.
+    x_int8 = x * (7. / amax)
     x_int8 += 0.5 * tl.where(x_int8 >= 0, 1, -1)
     x_int8 = x_int8.to(tl.int8)
     tl.store(output_ptrs, x_int8, mask=offs_n[:, None] < L)

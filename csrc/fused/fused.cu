@@ -124,15 +124,6 @@ __global__ void QuantInt8Kernel(T *__restrict__ input, T *__restrict__ mean, int
           x_val_float[i][j] -= mean_val_float[j];
         }
       }
-
-      if constexpr (has_sm_scale)
-      {
-#pragma unroll
-        for (uint32_t j = 0; j < 8; j++)
-        {
-          x_val_float[i][j] *= sm_scale;
-        }
-      }
     }
     else
     {
@@ -161,7 +152,15 @@ __global__ void QuantInt8Kernel(T *__restrict__ input, T *__restrict__ mean, int
   if (thread_id == 0)
   {
     s_amax = block_amax_val;
-    scale_ptr_base[0] = s_amax / 127.0f;
+    // quantization is scale-invariant, so sm_scale only needs to enter the dequant scale
+    if constexpr (has_sm_scale)
+    {
+      scale_ptr_base[0] = s_amax * (sm_scale / 127.0f);
+    }
+    else
+    {
+      scale_ptr_base[0] = s_amax / 127.0f;
+    }
   }
 
   __syncthreads();
@@ -342,7 +341,8 @@ __global__ void MeanScaleKernel(T *__restrict__ input, int8_t *__restrict__ outp
   float x_val_float[8];
   uint32_t x_val_fp8[2];
 
-  float max_val = - 1000000.0f;
+  // without smoothing only |x| matters, so max_val tracks max|x| and the min reduction is skipped
+  float max_val = sub_mean ? -1000000.0f : 0.0f;
   float min_val = 1000000.0f;
   float sum_val = 0.0f;
 
@@ -353,12 +353,23 @@ __global__ void MeanScaleKernel(T *__restrict__ input, int8_t *__restrict__ outp
     for (uint32_t j = 0; j < 8; j++)
     {
       float x_temp = convert_to_float(x_val[j]);
-      max_val = fmaxf(max_val, x_temp);
-      min_val = fminf(min_val, x_temp);
 
       if constexpr (sub_mean)
       {
+        // zero padding in the last 16-token group must not widen [min, max]: invert the fp8 permutation
+        // (TransposePadPermuteKernel) to recover the source token of this position
+        const uint32_t pos = i * gmem_stride + thread_id * pack_size + j;
+        const uint32_t token = (pos & ~15u) + ((pos >> 1) & 1) * 8 + ((pos >> 3) & 1) * 4 + ((pos >> 2) & 1) * 2 + (pos & 1);
+        if (token < num_tokens)
+        {
+          max_val = fmaxf(max_val, x_temp);
+          min_val = fminf(min_val, x_temp);
+        }
         sum_val += x_temp;
+      }
+      else
+      {
+        max_val = fmaxf(max_val, fabsf(x_temp));
       }
     }
   }
@@ -368,27 +379,34 @@ __global__ void MeanScaleKernel(T *__restrict__ input, int8_t *__restrict__ outp
   __shared__ float s_mean_val;
 
   float block_max_val = vllm::blockReduceMax(max_val);
-  float block_min_val = vllm::blockReduceMin(min_val);
-  float block_sum_val;
+  float block_min_val = 0.0f;
+  float block_sum_val = 0.0f;
 
   if constexpr (sub_mean)
   {
+    block_min_val = vllm::blockReduceMin(min_val);
     block_sum_val = vllm::blockReduceSum(sum_val);
   }
 
   if (thread_id == 0)
   {
-    s_mean_val = block_sum_val / fp8_padded_num_tokens;
+    float amax_val;
 
     if constexpr (sub_mean)
     {
-      s_amax_val = fmaxf(fabsf(block_max_val - s_mean_val), fabsf(block_min_val - s_mean_val));
+      // padded tokens are zero-filled, so the sum is exact over real tokens; divide by their count
+      s_mean_val = block_sum_val / num_tokens;
+      amax_val = fmaxf(fabsf(block_max_val - s_mean_val), fabsf(block_min_val - s_mean_val));
       mean[batch_id * stride_bz_mean + head_id * stride_h_mean + d_id] = s_mean_val;
     }
     else
     {
-      s_amax_val = fmaxf(fabsf(block_max_val), fabsf(block_min_val));
+      s_mean_val = 0.0f;
+      amax_val = block_max_val;
     }
+
+    // eps floor: an all-zero (or, when smoothing, constant) channel would otherwise quantize as 0 * inf = NaN
+    s_amax_val = fmaxf(amax_val, 0.0000001f);
 
     scale[batch_id * stride_bz_scale + head_id * stride_h_scale + d_id] = s_amax_val / scale_max;
   }
