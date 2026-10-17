@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
 import torch
 import triton
 import triton.language as tl
@@ -89,7 +90,7 @@ def per_block_int8(q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
         cu_seqlens_q, cu_seqlens_q_scale,
         q.stride(1), q.stride(0),
         q_int8.stride(1), q_int8.stride(0),
-        sm_scale=(sm_scale * 1.44269504), H=h_qo,
+        sm_scale=(sm_scale * math.log2(math.e)), H=h_qo,
         C=head_dim, BLK=BLKQ
     )
 

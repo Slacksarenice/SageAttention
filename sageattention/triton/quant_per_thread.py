@@ -58,22 +58,6 @@ def quant_key_per_thread_int8_kernel(Input, Output, Scale, L,
     off_h = tl.program_id(1)
     off_b = tl.program_id(2)
 
-    # offs_n = off_blk * BLK + tl.cat(tl.arange(0, BLK // 8) * 8, tl.arange(0, BLK // 8) * 8 + 1, True) + off_tld * 2
-    # offs_k = tl.arange(0, C)
-
-    # input_ptrs = Input + off_b * stride_iz + off_h * stride_ih + offs_n[:, None] * stride_in + offs_k[None, :]
-    # output_ptrs = Output + off_b * stride_oz + off_h * stride_oh + offs_n[:, None] * stride_on + offs_k[None, :]
-    # scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk * 4 + off_tld
-
-    # x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
-    # x = x.to(tl.float32)
-    # scale = tl.max(tl.abs(x)) / 127. + 0.0000001
-    # x_int8 = x / scale
-    # x_int8 += 0.5 * tl.where(x_int8 >= 0, 1, -1)
-    # x_int8 = x_int8.to(tl.int8)
-    # tl.store(output_ptrs, x_int8, mask=offs_n[:, None] < L)
-    # tl.store(scale_ptrs, scale)
-
     offs_n0 = off_blk * BLK + tl.arange(0, BLK // 8) * 8 + off_tld * 2
     offs_n1 = off_blk * BLK + tl.arange(0, BLK // 8) * 8 + off_tld * 2 + 1
     offs_k = tl.arange(0, C)

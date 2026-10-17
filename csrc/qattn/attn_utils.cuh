@@ -29,8 +29,6 @@
 
 // softmax runs in base 2, so the offset scales P by 2^S_FP8_OFFSET (~448, the e4m3 max)
 #define S_FP8_OFFSET 8.807f
-#define S_FP8_OFFSET_EXP 447.8898f
-#define S_FP8_OFFSET_EXP_INV 0.0022326917f
 
 #define div_ceil(M, N) (((M) + (N)-1) / (N))
 

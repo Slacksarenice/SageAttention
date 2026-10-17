@@ -50,7 +50,7 @@ def per_block_int8(
     
     sm_scale : Optional[float]
         The scale factor for the softmax operation. Default is ``head_dim**-0.5``. 
-        It will be multiplied by ``1.44269504`` to work together with the triton attention kernel.
+        It will be multiplied by ``log2(e)`` to work together with the triton attention kernel.
 
     tensor_layout : str
         The tensor layout, either "HND" or "NHD".

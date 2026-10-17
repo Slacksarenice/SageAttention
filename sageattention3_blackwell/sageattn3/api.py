@@ -28,7 +28,7 @@ def group_mean_kernel(
     q_ptr,          
     q_out_ptr,      
     qm_out_ptr,     
-    B, H, L, L_valid, D: tl.constexpr,
+    L_valid, D: tl.constexpr,
     stride_qb, stride_qh, stride_ql, stride_qd,
     stride_qmb, stride_qmh, stride_qml, stride_qmd,
     GROUP_SIZE: tl.constexpr
@@ -56,12 +56,11 @@ def group_mean_kernel(
     tl.store(qm_out_ptr + qm_offset, qm_group)
 
 
-def triton_group_mean(q: torch.Tensor, valid_len: int = None):
+def triton_group_mean(q: torch.Tensor, valid_len: int):
+    """Subtract each 128-row group's mean from a 128-padded ``q``; only its first ``valid_len`` rows are real."""
     B, H, L, D = q.shape
     GROUP_SIZE = 128
     num_groups = L // GROUP_SIZE
-    if valid_len is None:
-        valid_len = L
 
     q_out = torch.empty_like(q)  # [B, H, L, D]
     qm = torch.empty(B, H, num_groups, D, device=q.device, dtype=q.dtype)
@@ -70,7 +69,7 @@ def triton_group_mean(q: torch.Tensor, valid_len: int = None):
 
     group_mean_kernel[grid](
         q, q_out, qm,
-        B, H, L, valid_len, D,
+        valid_len, D,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         qm.stride(0), qm.stride(1), qm.stride(2), qm.stride(3),
         GROUP_SIZE=GROUP_SIZE
@@ -80,26 +79,39 @@ def triton_group_mean(q: torch.Tensor, valid_len: int = None):
 
 def preprocess_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, per_block_mean: bool = True):
 
-    def pad_128(x):
+    def pad_128(x, shift=None):
+        """Zero-pad the sequence dim to a multiple of 128, subtracting ``shift`` from the real rows if given."""
         L = x.size(2)
         pad_len = (128 - L % 128) % 128
-        if pad_len == 0:
-            return x.contiguous()
-        return F.pad(x, (0, 0, 0, pad_len), value=0).contiguous()
-    
+        if shift is None:
+            if pad_len == 0:
+                return x.contiguous()
+            return F.pad(x, (0, 0, 0, pad_len), value=0).contiguous()
+        # x - shift goes straight into a fresh padded buffer: one copy, and the caller's tensor is never modified
+        out = x.new_empty(x.size(0), x.size(1), L + pad_len, x.size(3))
+        out[:, :, L:].zero_()
+        torch.sub(x, shift, out=out[:, :, :L])
+        return out
+
     q_len = q.size(2)
-    # out of place: the caller's k must not be modified
-    k = k - k.mean(dim=-2, keepdim=True)
-    if not per_block_mean:
-        # take the mean before padding so zero rows do not bias it
-        qm = q.mean(dim=-2, keepdim=True)
-        q = q - qm
-    q, k, v = map(lambda x: pad_128(x), [q, k, v])
+    k = pad_128(k, k.mean(dim=-2, keepdim=True))
+    v = pad_128(v)
     if per_block_mean:
-        q, qm = triton_group_mean(q, q_len)
-    # fp16/bf16 products are exact in fp32, so only an fp32 output keeps this logit bias unrounded
-    delta_s = torch.matmul(qm.float(), k.float().transpose(-2, -1)).contiguous()
-    return q, k, v, delta_s
+        q, qm = triton_group_mean(pad_128(q), q_len)
+    else:
+        # mean over the real rows only, so zero padding does not bias it
+        qm = q.mean(dim=-2, keepdim=True)
+        q = pad_128(q, qm)
+    # the kernel reads delta_s as fp32, so autocast must not lower this GEMM to 16 bits
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        try:
+            # 16-bit GEMM with fp32 accumulation and output: products are exact and K is not upcast
+            delta_s = torch.bmm(qm.flatten(0, 1), k.flatten(0, 1).transpose(1, 2), out_dtype=torch.float32)
+        except (TypeError, RuntimeError):
+            # torch < 2.8 has no out_dtype, and fp16 under allow_fp16_accumulation rejects an fp32 output;
+            # fp16/bf16 values are exact in tf32, so the upcast GEMM loses nothing
+            delta_s = torch.bmm(qm.flatten(0, 1).float(), k.flatten(0, 1).float().transpose(1, 2))
+    return q, k, v, delta_s.unflatten(0, qm.shape[:2])
 
 def scale_and_quant_fp4(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.ndim == 4
