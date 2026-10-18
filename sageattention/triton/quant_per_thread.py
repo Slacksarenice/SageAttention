@@ -36,7 +36,7 @@ def quant_query_per_thread_int8_kernel(Input, Output, Scale, L,
     output_ptrs = Output + off_b * stride_oz + off_h * stride_oh + offs_n[:, None] * stride_on + offs_k[None, :]
     scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk * 8 + off_tld
 
-    x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
+    x = tl.load(input_ptrs, mask=offs_n[:, None] < L, other=0.0)
     x = x.to(tl.float32)
     # eps as a floor (not an additive bias) keeps the full int8 range for small-magnitude rows
     amax = tl.maximum(tl.max(tl.abs(x)), 1e-7)
@@ -68,8 +68,8 @@ def quant_key_per_thread_int8_kernel(Input, Output, Scale, L,
     output_ptrs1 = Output + off_b * stride_oz + off_h * stride_oh + offs_n1[:, None] * stride_on + offs_k[None, :]
     scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk * 4 + off_tld
 
-    x0 = tl.load(input_ptrs0, mask=offs_n0[:, None] < L)
-    x1 = tl.load(input_ptrs1, mask=offs_n1[:, None] < L)
+    x0 = tl.load(input_ptrs0, mask=offs_n0[:, None] < L, other=0.0)
+    x1 = tl.load(input_ptrs1, mask=offs_n1[:, None] < L, other=0.0)
     x0 = x0.to(tl.float32)
     x1 = x1.to(tl.float32)
     amax = tl.maximum(tl.maximum(tl.max(tl.abs(x0)), tl.max(tl.abs(x1))), 1e-7)
@@ -103,7 +103,7 @@ def quant_query_per_thread_int4_kernel(Input, Output, Scale, L,
     output_ptrs = Output + off_b * stride_oz + off_h * stride_oh + offs_n[:, None] * stride_on + offs_k[None, :]
     scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk * 8 + off_tld
 
-    x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
+    x = tl.load(input_ptrs, mask=offs_n[:, None] < L, other=0.0)
     x = x.to(tl.float32)
     amax = tl.maximum(tl.max(tl.abs(x)), 1e-7)
     scale = amax / 7.
@@ -131,7 +131,7 @@ def quant_key_per_thread_int4_kernel(Input, Output, Scale, L,
     output_ptrs = Output + off_b * stride_oz + off_h * stride_oh + offs_n[:, None] * stride_on + offs_k[None, :]
     scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk * 4 + off_tld
 
-    x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
+    x = tl.load(input_ptrs, mask=offs_n[:, None] < L, other=0.0)
     x = x.to(tl.float32)
     amax = tl.maximum(tl.max(tl.abs(x)), 1e-7)
     scale = amax / 7.

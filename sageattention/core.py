@@ -86,6 +86,9 @@ def _natural_lse(lse: torch.Tensor, q: torch.Tensor, km: Optional[torch.Tensor],
         try:
             # fp16/bf16 GEMM with an fp32 output, so the result is never rounded to 16 bits
             correction = torch.bmm(q_rows, km_col, out_dtype=torch.float32)
+        except torch.cuda.OutOfMemoryError:
+            # the fp32 fallback needs more memory, so retrying would only fail harder
+            raise
         except (TypeError, RuntimeError):
             # torch < 2.8 has no out_dtype, and fp16 under allow_fp16_accumulation rejects an fp32 output;
             # fp16/bf16 values are exact in tf32, so the upcast GEMM loses nothing

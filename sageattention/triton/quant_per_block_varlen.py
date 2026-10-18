@@ -48,7 +48,7 @@ def quant_per_block_int8_kernel(Input, Output, Scale,
     output_ptrs = Output + cu_seqlens_input_start * stride_on + off_h * stride_oh + offs_n[:, None] * stride_on + offs_k[None, :]
     scale_ptrs = Scale + cu_seqlens_scale_start * H + off_h + off_blk * H
 
-    x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
+    x = tl.load(input_ptrs, mask=offs_n[:, None] < L, other=0.0)
     x = x.to(tl.float32)
     # quantization is scale-invariant, so sm_scale only needs to enter the stored scale;
     # the eps floor keeps all-zero blocks finite (matches the CUDA QuantInt8Kernel)
