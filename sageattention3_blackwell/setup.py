@@ -153,7 +153,7 @@ class CachedWheelsCommand(_bdist_wheel):
 
 setup(
     name=PACKAGE_NAME,
-    version="1.0.0",
+    version="1.0.1",
     packages=find_packages(
         exclude=(
             "build",
