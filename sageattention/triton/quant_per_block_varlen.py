@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
 import torch
 import triton
 import triton.language as tl
@@ -47,11 +48,13 @@ def quant_per_block_int8_kernel(Input, Output, Scale,
     output_ptrs = Output + cu_seqlens_input_start * stride_on + off_h * stride_oh + offs_n[:, None] * stride_on + offs_k[None, :]
     scale_ptrs = Scale + cu_seqlens_scale_start * H + off_h + off_blk * H
 
-    x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
+    x = tl.load(input_ptrs, mask=offs_n[:, None] < L, other=0.0)
     x = x.to(tl.float32)
-    x *= sm_scale
-    scale = tl.max(tl.abs(x)) / 127.
-    x_int8 = x / scale
+    # quantization is scale-invariant, so sm_scale only needs to enter the stored scale;
+    # the eps floor keeps all-zero blocks finite (matches the CUDA QuantInt8Kernel)
+    amax = tl.maximum(tl.max(tl.abs(x)), 1e-7)
+    scale = amax * (sm_scale / 127.)
+    x_int8 = x * (127. / amax)
     x_int8 += 0.5 * tl.where(x_int8 >= 0, 1, -1)
     x_int8 = x_int8.to(tl.int8)
     tl.store(output_ptrs, x_int8, mask=offs_n[:, None] < L)
@@ -87,7 +90,7 @@ def per_block_int8(q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
         cu_seqlens_q, cu_seqlens_q_scale,
         q.stride(1), q.stride(0),
         q_int8.stride(1), q_int8.stride(0),
-        sm_scale=(sm_scale * 1.44269504), H=h_qo,
+        sm_scale=(sm_scale * math.log2(math.e)), H=h_qo,
         C=head_dim, BLK=BLKQ
     )
 

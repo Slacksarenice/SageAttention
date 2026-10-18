@@ -24,6 +24,7 @@
 #include "../cp_async.cuh"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cfloat>
 
 enum class QuantType
 {
@@ -124,15 +125,6 @@ __global__ void QuantInt8Kernel(T *__restrict__ input, T *__restrict__ mean, int
           x_val_float[i][j] -= mean_val_float[j];
         }
       }
-
-      if constexpr (has_sm_scale)
-      {
-#pragma unroll
-        for (uint32_t j = 0; j < 8; j++)
-        {
-          x_val_float[i][j] *= sm_scale;
-        }
-      }
     }
     else
     {
@@ -161,7 +153,15 @@ __global__ void QuantInt8Kernel(T *__restrict__ input, T *__restrict__ mean, int
   if (thread_id == 0)
   {
     s_amax = block_amax_val;
-    scale_ptr_base[0] = s_amax / 127.0f;
+    // quantization is scale-invariant, so sm_scale only needs to enter the dequant scale
+    if constexpr (has_sm_scale)
+    {
+      scale_ptr_base[0] = s_amax * (sm_scale / 127.0f);
+    }
+    else
+    {
+      scale_ptr_base[0] = s_amax / 127.0f;
+    }
   }
 
   __syncthreads();
@@ -259,6 +259,33 @@ __global__ void SubMeanKernel(T *__restrict__ input, T *__restrict__ mean, half 
   }
 }
 
+// fp8 mma k-order of V tokens: within each 16-token group, token m is stored at position fp8_v_permute(m)
+// (0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15)
+__host__ __device__ constexpr uint32_t fp8_v_permute(uint32_t m)
+{
+  return (m & ~15u) + ((m >> 3) & 1u) * 2 + ((m >> 1) & 3u) * 4 + (m & 1u);
+}
+
+// inverse of fp8_v_permute: the source token stored at position p
+__host__ __device__ constexpr uint32_t fp8_v_unpermute(uint32_t p)
+{
+  return (p & ~15u) + ((p >> 1) & 1u) * 8 + ((p >> 3) & 1u) * 4 + ((p >> 2) & 1u) * 2 + (p & 1u);
+}
+
+__host__ __device__ constexpr bool fp8_v_permute_round_trips()
+{
+  for (uint32_t m = 0; m < 16; m++)
+  {
+    if (fp8_v_unpermute(fp8_v_permute(m)) != m)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+static_assert(fp8_v_permute_round_trips(), "fp8_v_unpermute must invert fp8_v_permute");
+
 template <uint32_t head_dim, uint32_t CTA_SIZE, bool pad_zero=false, typename T>
 __global__ void TransposePadPermuteKernel(T *__restrict__ input, T *__restrict__ output, const uint32_t num_tokens,
                             const uint32_t stride_bz_input, const uint32_t stride_seq_input, const uint32_t stride_h_input,
@@ -266,6 +293,7 @@ __global__ void TransposePadPermuteKernel(T *__restrict__ input, T *__restrict__
 {
 
   static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value, "Only half and bfloat16 are supported");
+  static_assert(CTA_SIZE % 16 == 0, "the fp8 permutation works on whole 16-token groups");
 
   constexpr uint32_t pack_size = 8; // float4 contains 8 half or 8 bfloat16
   uint32_t num_threads_per_token = head_dim / pack_size;
@@ -284,11 +312,8 @@ __global__ void TransposePadPermuteKernel(T *__restrict__ input, T *__restrict__
   __shared__ T shared_load[CTA_SIZE][head_dim];
   __shared__ T shared_store[head_dim][CTA_SIZE];
 
-  // 0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15
   // permute on the seq dimension for fp8 mma
-  uint32_t smem_load_row_base = ((thread_id / num_threads_per_token) / 16) * 16;
-  uint32_t smem_load_row_mod = (thread_id / num_threads_per_token) % 16;
-  uint32_t smem_load_row = smem_load_row_base + (smem_load_row_mod  / 8) * 2 + ((smem_load_row_mod / 2) % 4) * 4 + (smem_load_row_mod % 2);
+  uint32_t smem_load_row = fp8_v_permute(thread_id / num_threads_per_token);
 
   constexpr cp_async::SharedMemFillMode fill_mode = pad_zero ? cp_async::SharedMemFillMode::kFillZero : cp_async::SharedMemFillMode::kNoFill;
   cp_async::pred_load_128b<cp_async::PrefetchMode::kNoPrefetch, fill_mode>(shared_load[smem_load_row] + thread_id % num_threads_per_token * pack_size, input_ptr_base, thread_base_token < num_tokens);
@@ -342,8 +367,9 @@ __global__ void MeanScaleKernel(T *__restrict__ input, int8_t *__restrict__ outp
   float x_val_float[8];
   uint32_t x_val_fp8[2];
 
-  float max_val = - 1000000.0f;
-  float min_val = 1000000.0f;
+  // without smoothing only |x| matters, so max_val tracks max|x| and the min reduction is skipped
+  float max_val = sub_mean ? -FLT_MAX : 0.0f;
+  float min_val = FLT_MAX;
   float sum_val = 0.0f;
 
   for (int i = 0; i < num_iters; i++)
@@ -353,12 +379,21 @@ __global__ void MeanScaleKernel(T *__restrict__ input, int8_t *__restrict__ outp
     for (uint32_t j = 0; j < 8; j++)
     {
       float x_temp = convert_to_float(x_val[j]);
-      max_val = fmaxf(max_val, x_temp);
-      min_val = fminf(min_val, x_temp);
 
       if constexpr (sub_mean)
       {
-        sum_val += x_temp;
+        // padding in the last 16-token group must not enter the statistics: map the position back
+        // to its source token through the fp8 permutation applied by TransposePadPermuteKernel
+        if (fp8_v_unpermute(i * gmem_stride + thread_id * pack_size + j) < num_tokens)
+        {
+          max_val = fmaxf(max_val, x_temp);
+          min_val = fminf(min_val, x_temp);
+          sum_val += x_temp;
+        }
+      }
+      else
+      {
+        max_val = fmaxf(max_val, fabsf(x_temp));
       }
     }
   }
@@ -368,27 +403,34 @@ __global__ void MeanScaleKernel(T *__restrict__ input, int8_t *__restrict__ outp
   __shared__ float s_mean_val;
 
   float block_max_val = vllm::blockReduceMax(max_val);
-  float block_min_val = vllm::blockReduceMin(min_val);
-  float block_sum_val;
+  float block_min_val = 0.0f;
+  float block_sum_val = 0.0f;
 
   if constexpr (sub_mean)
   {
+    block_min_val = vllm::blockReduceMin(min_val);
     block_sum_val = vllm::blockReduceSum(sum_val);
   }
 
   if (thread_id == 0)
   {
-    s_mean_val = block_sum_val / fp8_padded_num_tokens;
+    float amax_val;
 
     if constexpr (sub_mean)
     {
-      s_amax_val = fmaxf(fabsf(block_max_val - s_mean_val), fabsf(block_min_val - s_mean_val));
+      // the sum covers real tokens only
+      s_mean_val = block_sum_val / num_tokens;
+      amax_val = fmaxf(fabsf(block_max_val - s_mean_val), fabsf(block_min_val - s_mean_val));
       mean[batch_id * stride_bz_mean + head_id * stride_h_mean + d_id] = s_mean_val;
     }
     else
     {
-      s_amax_val = fmaxf(fabsf(block_max_val), fabsf(block_min_val));
+      s_mean_val = 0.0f;
+      amax_val = block_max_val;
     }
+
+    // eps floor: an all-zero (or, when smoothing, constant) channel would otherwise quantize as 0 * inf = NaN
+    s_amax_val = fmaxf(amax_val, 0.0000001f);
 
     scale[batch_id * stride_bz_scale + head_id * stride_h_scale + d_id] = s_amax_val / scale_max;
   }

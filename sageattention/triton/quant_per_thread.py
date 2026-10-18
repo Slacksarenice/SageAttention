@@ -36,10 +36,12 @@ def quant_query_per_thread_int8_kernel(Input, Output, Scale, L,
     output_ptrs = Output + off_b * stride_oz + off_h * stride_oh + offs_n[:, None] * stride_on + offs_k[None, :]
     scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk * 8 + off_tld
 
-    x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
+    x = tl.load(input_ptrs, mask=offs_n[:, None] < L, other=0.0)
     x = x.to(tl.float32)
-    scale = tl.max(tl.abs(x)) / 127. + 0.0000001
-    x_int8 = x / scale
+    # eps as a floor (not an additive bias) keeps the full int8 range for small-magnitude rows
+    amax = tl.maximum(tl.max(tl.abs(x)), 1e-7)
+    scale = amax / 127.
+    x_int8 = x * (127. / amax)
     x_int8 += 0.5 * tl.where(x_int8 >= 0, 1, -1)
     x_int8 = x_int8.to(tl.int8)
     tl.store(output_ptrs, x_int8, mask=offs_n[:, None] < L)
@@ -56,22 +58,6 @@ def quant_key_per_thread_int8_kernel(Input, Output, Scale, L,
     off_h = tl.program_id(1)
     off_b = tl.program_id(2)
 
-    # offs_n = off_blk * BLK + tl.cat(tl.arange(0, BLK // 8) * 8, tl.arange(0, BLK // 8) * 8 + 1, True) + off_tld * 2
-    # offs_k = tl.arange(0, C)
-
-    # input_ptrs = Input + off_b * stride_iz + off_h * stride_ih + offs_n[:, None] * stride_in + offs_k[None, :]
-    # output_ptrs = Output + off_b * stride_oz + off_h * stride_oh + offs_n[:, None] * stride_on + offs_k[None, :]
-    # scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk * 4 + off_tld
-
-    # x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
-    # x = x.to(tl.float32)
-    # scale = tl.max(tl.abs(x)) / 127. + 0.0000001
-    # x_int8 = x / scale
-    # x_int8 += 0.5 * tl.where(x_int8 >= 0, 1, -1)
-    # x_int8 = x_int8.to(tl.int8)
-    # tl.store(output_ptrs, x_int8, mask=offs_n[:, None] < L)
-    # tl.store(scale_ptrs, scale)
-
     offs_n0 = off_blk * BLK + tl.arange(0, BLK // 8) * 8 + off_tld * 2
     offs_n1 = off_blk * BLK + tl.arange(0, BLK // 8) * 8 + off_tld * 2 + 1
     offs_k = tl.arange(0, C)
@@ -82,13 +68,15 @@ def quant_key_per_thread_int8_kernel(Input, Output, Scale, L,
     output_ptrs1 = Output + off_b * stride_oz + off_h * stride_oh + offs_n1[:, None] * stride_on + offs_k[None, :]
     scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk * 4 + off_tld
 
-    x0 = tl.load(input_ptrs0, mask=offs_n0[:, None] < L)
-    x1 = tl.load(input_ptrs1, mask=offs_n1[:, None] < L)
+    x0 = tl.load(input_ptrs0, mask=offs_n0[:, None] < L, other=0.0)
+    x1 = tl.load(input_ptrs1, mask=offs_n1[:, None] < L, other=0.0)
     x0 = x0.to(tl.float32)
     x1 = x1.to(tl.float32)
-    scale = max(tl.max(tl.abs(x0)), tl.max(tl.abs(x1))) / 127. + 0.0000001
-    x0_int8 = x0 / scale
-    x1_int8 = x1 / scale
+    amax = tl.maximum(tl.maximum(tl.max(tl.abs(x0)), tl.max(tl.abs(x1))), 1e-7)
+    scale = amax / 127.
+    rcp_scale = 127. / amax
+    x0_int8 = x0 * rcp_scale
+    x1_int8 = x1 * rcp_scale
     x0_int8 += 0.5 * tl.where(x0_int8 >= 0, 1, -1)
     x1_int8 += 0.5 * tl.where(x1_int8 >= 0, 1, -1)
     x0_int8 = x0_int8.to(tl.int8)
@@ -115,10 +103,11 @@ def quant_query_per_thread_int4_kernel(Input, Output, Scale, L,
     output_ptrs = Output + off_b * stride_oz + off_h * stride_oh + offs_n[:, None] * stride_on + offs_k[None, :]
     scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk * 8 + off_tld
 
-    x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
+    x = tl.load(input_ptrs, mask=offs_n[:, None] < L, other=0.0)
     x = x.to(tl.float32)
-    scale = tl.max(tl.abs(x)) / 7. + 0.0000001
-    x_int8 = x / scale
+    amax = tl.maximum(tl.max(tl.abs(x)), 1e-7)
+    scale = amax / 7.
+    x_int8 = x * (7. / amax)
     x_int8 += 0.5 * tl.where(x_int8 >= 0, 1, -1)
     x_int8 = x_int8.to(tl.int8)
     tl.store(output_ptrs, x_int8, mask=offs_n[:, None] < L)
@@ -142,10 +131,11 @@ def quant_key_per_thread_int4_kernel(Input, Output, Scale, L,
     output_ptrs = Output + off_b * stride_oz + off_h * stride_oh + offs_n[:, None] * stride_on + offs_k[None, :]
     scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk * 4 + off_tld
 
-    x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
+    x = tl.load(input_ptrs, mask=offs_n[:, None] < L, other=0.0)
     x = x.to(tl.float32)
-    scale = tl.max(tl.abs(x)) / 7. + 0.0000001
-    x_int8 = x / scale
+    amax = tl.maximum(tl.max(tl.abs(x)), 1e-7)
+    scale = amax / 7.
+    x_int8 = x * (7. / amax)
     x_int8 += 0.5 * tl.where(x_int8 >= 0, 1, -1)
     x_int8 = x_int8.to(tl.int8)
     tl.store(output_ptrs, x_int8, mask=offs_n[:, None] < L)

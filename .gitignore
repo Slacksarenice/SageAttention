@@ -6,6 +6,8 @@
 /test
 __pycache__
 *.so
+*.pyd
+.venv/
 evaluate/
 *.pkl
 *.vscode/

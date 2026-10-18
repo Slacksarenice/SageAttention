@@ -52,8 +52,48 @@ from .quant import per_channel_fp8
 from typing import Any, List, Literal, Optional, Tuple, Union
 import warnings
 
+import math
 import subprocess
 import re
+
+# kernels return lse in base 2; ln(2) converts it back to natural log
+LN2 = math.log(2.0)
+
+
+def _natural_lse(lse: torch.Tensor, q: torch.Tensor, km: Optional[torch.Tensor], tensor_layout: str, sm_scale: float) -> torch.Tensor:
+    """
+    Convert a kernel's base-2 lse to natural log and add back the logit offset removed by smooth_k.
+
+    softmax is invariant to subtracting ``km`` from every key, but the logsumexp shifts by
+    ``sm_scale * q . km``. That term is kept in fp32: rounded to bf16/fp16 it would put ~1e-2 error
+    into the lse.
+
+    Shapes: ``lse [b, h_qo, n]``; HND ``q [b, h_qo, n, d]``, ``km [b, h_kv, 1, d]``; NHD
+    ``q [b, n, h_qo, d]``, ``km [b, 1, h_kv, d]``. ``km`` is None when smooth_k is off.
+    """
+    lse = lse * LN2
+    if km is None:
+        return lse
+    if tensor_layout == "NHD":
+        q, km = q.transpose(1, 2), km.transpose(1, 2)
+    b, h_qo, n, d = q.shape
+    # one GEMV per q head (q head h reads kv head h // g): q stays a view wherever its layout allows,
+    # and only the tiny km is repeated
+    q_rows = q.reshape(b * h_qo, n, d)
+    km_col = km.repeat_interleave(h_qo // km.size(1), dim=1).reshape(b * h_qo, d, 1)
+    # autocast would run the fp32 fallback GEMM in 16 bits
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        try:
+            # fp16/bf16 GEMM with an fp32 output, so the result is never rounded to 16 bits
+            correction = torch.bmm(q_rows, km_col, out_dtype=torch.float32)
+        except torch.cuda.OutOfMemoryError:
+            # the fp32 fallback needs more memory, so retrying would only fail harder
+            raise
+        except (TypeError, RuntimeError):
+            # torch < 2.8 has no out_dtype, and fp16 under allow_fp16_accumulation rejects an fp32 output;
+            # fp16/bf16 values are exact in tf32, so the upcast GEMM loses nothing
+            correction = torch.bmm(q_rows.float(), km_col.float())
+    return lse + correction.reshape(b, h_qo, n) * sm_scale
 
 
 def get_cuda_version():
@@ -274,23 +314,9 @@ def sageattn_qk_int8_pv_fp16_triton(
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
 
     seq_dim = 1 if tensor_layout == "NHD" else 2
-    nh_dim = 2 if tensor_layout == "NHD" else 1
 
     if smooth_k:
         km = k.mean(dim=seq_dim, keepdim=True)
-        nqheads = q.size(nh_dim)
-        nkheads = k.size(nh_dim)
-        q_per_kv_heads = nqheads // nkheads
-        if q_per_kv_heads > 1:
-            # nheads_k => nheads_q
-            km_broadcast = torch.repeat_interleave(km, q_per_kv_heads, dim=nh_dim)
-        else:
-            km_broadcast = km
-        if return_lse:
-            if tensor_layout == "NHD":
-                lse_correction = torch.matmul(q.transpose(1, 2), km_broadcast.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
-            else:
-                lse_correction = torch.matmul(q, km_broadcast.transpose(2, 3)).squeeze(-1).to(torch.float32)
     else:
         km = None
 
@@ -326,7 +352,7 @@ def sageattn_qk_int8_pv_fp16_triton(
     o = o[..., :head_dim_og]
 
     if return_lse:
-        return o, lse / 1.44269504 + lse_correction * sm_scale if smooth_k else lse / 1.44269504
+        return o, _natural_lse(lse, q, km, tensor_layout, sm_scale)
     else:
         return o
 
@@ -578,23 +604,9 @@ def sageattn_qk_int8_pv_fp16_cuda(
         sm_scale = head_dim_og**-0.5
 
     seq_dim = 1 if _tensor_layout == 0 else 2
-    nh_dim = 2 if _tensor_layout == 0 else 1
 
     if smooth_k:
         km = k.mean(dim=seq_dim, keepdim=True)
-        nqheads = q.size(nh_dim)
-        nkheads = k.size(nh_dim)
-        q_per_kv_heads = nqheads // nkheads
-        if q_per_kv_heads > 1:
-            # nheads_k => nheads_q
-            km_broadcast = torch.repeat_interleave(km, q_per_kv_heads, dim=nh_dim)
-        else:
-            km_broadcast = km
-        if return_lse:
-            if tensor_layout == "NHD":
-                lse_correction = torch.matmul(q.transpose(1, 2), km_broadcast.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
-            else:
-                lse_correction = torch.matmul(q, km_broadcast.transpose(2, 3)).squeeze(-1).to(torch.float32)
     else:
         km = None
 
@@ -628,7 +640,7 @@ def sageattn_qk_int8_pv_fp16_cuda(
     o = o[..., :head_dim_og]
 
     if return_lse:
-        return o, lse / 1.44269504 + lse_correction * sm_scale if smooth_k else lse / 1.44269504
+        return o, _natural_lse(lse, q, km, tensor_layout, sm_scale)
     else:
         return o
 
@@ -767,23 +779,9 @@ def sageattn_qk_int8_pv_fp8_cuda(
         sm_scale = head_dim_og**-0.5
 
     seq_dim = 1 if _tensor_layout == 0 else 2
-    nh_dim = 2 if _tensor_layout == 0 else 1    
 
     if smooth_k:
         km = k.mean(dim=seq_dim, keepdim=True)
-        nqheads = q.size(nh_dim)
-        nkheads = k.size(nh_dim)
-        q_per_kv_heads = nqheads // nkheads
-        if q_per_kv_heads > 1:
-            # nheads_k => nheads_q
-            km_broadcast = torch.repeat_interleave(km, q_per_kv_heads, dim=nh_dim)
-        else:
-            km_broadcast = km
-        if return_lse:
-            if tensor_layout == "NHD":
-                lse_correction = torch.matmul(q.transpose(1, 2), km_broadcast.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
-            else:
-                lse_correction = torch.matmul(q, km_broadcast.transpose(2, 3)).squeeze(-1).to(torch.float32)
     else:
         km = None
 
@@ -821,7 +819,7 @@ def sageattn_qk_int8_pv_fp8_cuda(
     o = o[..., :head_dim_og]
 
     if return_lse:
-        return o, lse / 1.44269504 + lse_correction * sm_scale if smooth_k else lse / 1.44269504
+        return o, _natural_lse(lse, q, km, tensor_layout, sm_scale)
     else:
         return o
 
@@ -943,23 +941,9 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
         sm_scale = head_dim_og**-0.5
 
     seq_dim = 1 if _tensor_layout == 0 else 2
-    nh_dim = 2 if _tensor_layout == 0 else 1
 
     if smooth_k:
         km = k.mean(dim=seq_dim, keepdim=True)
-        nqheads = q.size(nh_dim)
-        nkheads = k.size(nh_dim)
-        q_per_kv_heads = nqheads // nkheads
-        if q_per_kv_heads > 1:
-            # nheads_k => nheads_q
-            km_broadcast = torch.repeat_interleave(km, q_per_kv_heads, dim=nh_dim)
-        else:
-            km_broadcast = km
-        if return_lse:
-            if tensor_layout == "NHD":
-                lse_correction = torch.matmul(q.transpose(1, 2), km_broadcast.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
-            else:
-                lse_correction = torch.matmul(q, km_broadcast.transpose(2, 3)).squeeze(-1).to(torch.float32)
     else:
         km = None
 
@@ -991,6 +975,6 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     o = o[..., :head_dim_og]
 
     if return_lse:
-        return o, lse / 1.44269504 + lse_correction * sm_scale if smooth_k else lse / 1.44269504
+        return o, _natural_lse(lse, q, km, tensor_layout, sm_scale)
     else:
         return o
